@@ -38,10 +38,17 @@ import androidx.compose.ui.unit.dp
 import com.example.chatfat.data.ChatfatDatabase
 import com.example.chatfat.data.MessageEntity
 import com.example.chatfat.ui.theme.ChatfatTheme
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.UUID
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val SEND_DEBOUNCE_MS = 500L
+private const val HEALTH_URL = "http://127.0.0.1:3000/health"
+private const val MESSAGES_URL = "http://127.0.0.1:3000/messages"
 
 enum class MessageStatus {
     PENDING,
@@ -71,6 +78,7 @@ fun ChatScreen() {
     val coroutineScope = rememberCoroutineScope()
     var input by remember { mutableStateOf("") }
     var lastSendTime by remember { mutableLongStateOf(0L) }
+    var backendStatus by remember { mutableStateOf("Not checked") }
 
     Scaffold(
         topBar = { TopAppBar(title = { Text("Chatfat") }) },
@@ -95,6 +103,30 @@ fun ChatScreen() {
                 ) { message ->
                     MessageCard(message)
                 }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = {
+                        backendStatus = "Checking..."
+                        coroutineScope.launch {
+                            backendStatus = try {
+                                withContext(Dispatchers.IO) { fetchBackendStatus() }
+                            } catch (exception: Exception) {
+                                "Error: ${exception.message ?: "request failed"}"
+                            }
+                        }
+                    }
+                ) {
+                    Text("Check Backend")
+                }
+                Text("Backend: $backendStatus")
             }
 
             Row(
@@ -125,6 +157,19 @@ fun ChatScreen() {
                         )
                         coroutineScope.launch {
                             database.messageDao().insert(message)
+                            try {
+                                val status = withContext(Dispatchers.IO) {
+                                    sendMessageToBackend(message)
+                                }
+                                if (status == MessageStatus.SENT.name) {
+                                    database.messageDao().updateMessageStatus(
+                                        clientMessageId = message.clientMessageId,
+                                        status = status
+                                    )
+                                }
+                            } catch (_: Exception) {
+                                // Leave the locally saved message as PENDING for now.
+                            }
                         }
                         input = ""
                         lastSendTime = now
@@ -134,6 +179,60 @@ fun ChatScreen() {
                 }
             }
         }
+    }
+}
+
+private fun sendMessageToBackend(message: MessageEntity): String {
+    val connection = URL(MESSAGES_URL).openConnection() as HttpURLConnection
+    return try {
+        connection.requestMethod = "POST"
+        connection.doOutput = true
+        connection.connectTimeout = 5_000
+        connection.readTimeout = 5_000
+        connection.setRequestProperty("Content-Type", "application/json")
+
+        val requestBody = JSONObject()
+            .put("clientMessageId", message.clientMessageId)
+            .put("text", message.text)
+            .toString()
+        connection.outputStream.use { output ->
+            output.write(requestBody.toByteArray())
+        }
+
+        if (connection.responseCode !in 200..299) {
+            throw IllegalStateException("HTTP ${connection.responseCode}")
+        }
+
+        val response = connection.inputStream.bufferedReader().use { it.readText() }
+        Regex("\\\"status\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"")
+            .find(response)
+            ?.groupValues
+            ?.get(1)
+            ?: throw IllegalStateException("Invalid response")
+    } finally {
+        connection.disconnect()
+    }
+}
+
+private fun fetchBackendStatus(): String {
+    val connection = URL(HEALTH_URL).openConnection() as HttpURLConnection
+    return try {
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 5_000
+        connection.readTimeout = 5_000
+
+        if (connection.responseCode !in 200..299) {
+            "Error: HTTP ${connection.responseCode}"
+        } else {
+            val response = connection.inputStream.bufferedReader().use { it.readText() }
+            val status = Regex("\\\"status\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"")
+                .find(response)
+                ?.groupValues
+                ?.get(1)
+            status ?: "Error: invalid response"
+        }
+    } finally {
+        connection.disconnect()
     }
 }
 
